@@ -1,148 +1,79 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import cv2
-import threading
-import time
-import base64
 import numpy as np
-import io
+import os
 
-from fastapi import FastAPI, UploadFile, File, Query
-from fastapi.responses import StreamingResponse, JSONResponse
-import cv2
-import threading
-import base64
-import time
-import numpy as np
+app = FastAPI(title="NexaAI Proctoring App")
 
+# -----------------------------
+# Load Haar Cascade dynamically
+# -----------------------------
+try:
+    cascade_path = os.path.join(os.path.dirname(__file__), "XML", "haarcascade_fullbody.xml")
+    cascade = cv2.CascadeClassifier(cascade_path)
+    if cascade.empty():
+        raise ValueError("Failed to load Haar Cascade XML file!")
+except Exception as e:
+    raise RuntimeError(f"Error loading cascade: {e}")
 
-app = FastAPI(title="Proctoring API - Live Person Detection with Base64 Frames")
-
-# -------------------------
-# Load Haar Cascade for person detection
-# -------------------------
-cascade_path = cv2.data.haarcascades + "haarcascade_fullbody.xml"
-person_cascade = cv2.CascadeClassifier(cascade_path)
-if person_cascade.empty():
-    raise RuntimeError(f"Failed to load cascade classifier from {cascade_path}")
-
-# -------------------------
-# Shared state for JSON endpoint
-# -------------------------
-live_detection_data = {
-    "persons_detected": 0,
-    "coordinates": [],
-    "frame_b64": None
-}
-
-lock = threading.Lock()
-
-# -------------------------
-# Root and ping endpoints
-# -------------------------
+# -----------------------------
+# Root endpoint
+# -----------------------------
 @app.get("/")
 async def root():
-    return {"detail": "Proctoring API is running! Visit /webcam for live video or /json for live detection data."}
+    return {"message": "NexaAI Proctoring API is running."}
 
-@app.get("/ping")
-async def ping():
-    return {"detail": "pong"}
+# -----------------------------
+# Test cascade endpoint
+# -----------------------------
+@app.get("/test_cascade")
+async def test_cascade():
+    if cascade.empty():
+        raise HTTPException(status_code=500, detail="Cascade not loaded")
+    return JSONResponse(content={"status": "Cascade loaded successfully", "cascade_path": cascade_path})
 
-# -------------------------
-# Generator function for streaming frames
-# -------------------------
-def webcam_loop():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open webcam")
+# -----------------------------
+# Person detection endpoint
+# -----------------------------
+@app.post("/detect_person")
+async def detect_person(file: UploadFile = File(...)):
+    # Ensure uploaded file is an image
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    # Read image file into numpy array
+    file_bytes = await file.read()
+    np_arr = np.frombuffer(file_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not read image")
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            persons = person_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(30, 30)
-            )
+    # Convert to grayscale for Haar Cascade
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            coordinates = []
-            for (x, y, w, h) in persons:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                coordinates.append({"x": int(x), "y": int(y), "width": int(w), "height": int(h)})
+    # Detect people
+    bodies = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
 
-            # Encode frame as JPEG and then base64
-            _, buffer = cv2.imencode(".jpg", frame)
-            frame_b64 = base64.b64encode(buffer).decode("utf-8")
+    # Format detection results
+    detections = [{"x": int(x), "y": int(y), "w": int(w), "h": int(h)} for (x, y, w, h) in bodies]
 
-            with lock:
-                live_detection_data["persons_detected"] = len(coordinates)
-                live_detection_data["coordinates"] = coordinates
-                live_detection_data["frame_b64"] = frame_b64
+    return JSONResponse(content={
+        "filename": file.filename,
+        "detections": detections,
+        "num_people_detected": len(detections)
+    })
 
-            time.sleep(0.03)
-    finally:
-        cap.release()
+# -----------------------------
+# Run app if executed directly
+# -----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))  # Railway assigns $PORT
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
 
-# Start webcam loop in a background thread
-threading.Thread(target=webcam_loop, daemon=True).start()
 
-# -------------------------
-# Real-time JSON endpoint with optional base64 frame
-# -------------------------
-@app.get("/json")
-async def live_json(include_frame: bool = Query(False, description="Include base64-encoded current frame")):
-    with lock:
-        data_copy = {
-            "persons_detected": live_detection_data["persons_detected"],
-            "coordinates": live_detection_data["coordinates"]
-        }
-        if include_frame and live_detection_data["frame_b64"]:
-            data_copy["frame_b64"] = live_detection_data["frame_b64"]
-    return JSONResponse(content=data_copy)
-
-# -------------------------
-# MJPEG video streaming (optional)
-# -------------------------
-def gen_frames():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open webcam")
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            persons = person_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(30, 30)
-            )
-
-            for (x, y, w, h) in persons:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-            time.sleep(0.03)
-    finally:
-        cap.release()
-
-@app.get("/webcam")
-async def webcam_feed():
-    return StreamingResponse(gen_frames(),
-                             media_type='multipart/x-mixed-replace; boundary=frame')
 
 
 
